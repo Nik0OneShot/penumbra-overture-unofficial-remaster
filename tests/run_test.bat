@@ -19,12 +19,12 @@ if exist "%GAME%\SDL_image_orig.dll" (
 ) else (
     copy /y "%GAME%\SDL_image.dll" "%WORK%\SDL_image_orig.dll" >nul
 )
-for %%d in (SDL.dll jpeg.dll libpng12.dll libpng13.dll zlib1.dll) do copy /y "%GAME%\%%d" "%WORK%\" >nul
+for %%d in (SDL.dll jpeg.dll libpng12.dll libpng13.dll zlib1.dll msvcr71.dll Newton.dll) do copy /y "%GAME%\%%d" "%WORK%\" >nul
 copy /y "%GAME%\graphics\menu\menu_background.jpg" "%WORK%\test.jpg" >nul
 pushd "%WORK%"
-"%WORK%\patch_test.exe" "%DUMP%" test.jpg
+"%WORK%\patch_test.exe" "%DUMP%" test.jpg "%GAME%"
 set RC=%ERRORLEVEL%
 echo ---- PenumbraUltrawide.log ----
-type PenumbraUltrawide.log
+type "%WORK%\PenumbraUltrawide.log"
 popd
 exit /b %RC%

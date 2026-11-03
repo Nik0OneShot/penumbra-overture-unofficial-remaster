@@ -1,8 +1,8 @@
 // PenumbraUltrawide - widescreen/ultrawide fix for Penumbra: Overture (Steam build 459398).
 //
 // Ships as a stand-in SDL_image.dll that forwards every export to the real library
-// (renamed SDL_image_orig.dll). On the game's first IMG_Load call, after the Steam stub
-// has decrypted the executable, it patches the game in memory:
+// (renamed SDL_image_orig.dll). At the game's first SDL_Init call, after the Steam stub has
+// decrypted the executable, it patches the game in memory:
 //
 //   * Menus, HUD, text and the inventory keep their 4:3 shape, centred (pillarboxed),
 //     instead of being stretched across the screen.
@@ -11,19 +11,18 @@
 //   * The in-world cursor stays on the object it points at.
 //   * Horizontal mouse speed matches vertical again (it was ~1.8x slower at 21:9).
 //   * The options menu offers modern resolutions, including the desktop resolution.
+//   * Game logic runs at the monitor's refresh rate (HighFramerate.cpp).
 //
 // Every patch site is checked against the expected original bytes first; if anything
 // differs (another game version), nothing is patched and the reason is logged.
 
-#include <windows.h>
+#include "Patch.h"
 #include <intrin.h>
 #include <GL/gl.h>
 #include <stdio.h>
 #include <stdarg.h>
 
 #pragma intrinsic(_ReturnAddress)
-
-typedef unsigned char u8;
 
 //////////////////////////////////////////////////////////////////////////
 // Game addresses (Penumbra.exe, image base 0x400000, no ASLR)
@@ -67,10 +66,10 @@ namespace A {
 //////////////////////////////////////////////////////////////////////////
 // Logging and config
 
-static char g_dir[MAX_PATH];
+char g_dir[MAX_PATH];
 static FILE* g_log;
 
-static void Log(const char* fmt, ...)
+void Log(const char* fmt, ...)
 {
 	if(!g_log) return;
 	va_list va; va_start(va, fmt);
@@ -80,7 +79,7 @@ static void Log(const char* fmt, ...)
 	fflush(g_log);
 }
 
-static int CfgInt(const char* key, int def)
+int CfgInt(const char* key, int def)
 {
 	char path[MAX_PATH];
 	_snprintf_s(path, sizeof(path), _TRUNCATE, "%sPenumbraUltrawide.ini", g_dir);
@@ -271,23 +270,23 @@ static bool SameBytes(DWORD addr, const void* bytes, size_t n)
 	__except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-static bool Expect(DWORD addr, const void* bytes, size_t n, const char* what)
+bool Expect(DWORD addr, const void* bytes, size_t n, const char* what)
 {
 	if(SameBytes(addr, bytes, n)) return true;
 	Log("  mismatch at %08X (%s)", addr, what);
 	return false;
 }
 
-static bool ExpectDword(DWORD addr, DWORD val, const char* what) { return Expect(addr, &val, 4, what); }
+bool ExpectDword(DWORD addr, DWORD val, const char* what) { return Expect(addr, &val, 4, what); }
 
-static bool ExpectCall(DWORD site, DWORD target, const char* what)
+bool ExpectCall(DWORD site, DWORD target, const char* what)
 {
 	u8 b[5]; b[0] = 0xE8;
 	*(DWORD*)(b + 1) = target - (site + 5);
 	return Expect(site, b, 5, what);
 }
 
-static void Write(DWORD addr, const void* bytes, size_t n)
+void Write(DWORD addr, const void* bytes, size_t n)
 {
 	DWORD old;
 	VirtualProtect((void*)addr, n, PAGE_EXECUTE_READWRITE, &old);
@@ -296,9 +295,9 @@ static void Write(DWORD addr, const void* bytes, size_t n)
 	FlushInstructionCache(GetCurrentProcess(), (void*)addr, n);
 }
 
-static void WriteDword(DWORD addr, DWORD val) { Write(addr, &val, 4); }
+void WriteDword(DWORD addr, DWORD val) { Write(addr, &val, 4); }
 
-static void RedirectCall(DWORD site, const void* fn)
+void RedirectCall(DWORD site, const void* fn)
 {
 	DWORD rel = (DWORD)fn - (site + 5);
 	Write(site + 1, &rel, 4);
@@ -391,7 +390,6 @@ static void PatchResolutions()
 
 static void ApplyPatches()
 {
-	Log("Penumbra Ultrawide: patching");
 	if(!VerifyGame())
 	{
 		Log("Unexpected game code: this fix targets the Steam build (459398). Nothing was patched.");
@@ -419,6 +417,12 @@ static void ApplyPatches()
 	{
 		PatchResolutions();
 		Log("  options menu resolutions updated");
+	}
+	int rate = ChooseLogicRate();
+	if(rate != 60)
+	{
+		if(VerifyHighFramerate()) ApplyHighFramerate(rate);
+		else Log("  high framerate skipped: unexpected code, game logic stays at 60 Hz");
 	}
 	Log("Done.");
 }
@@ -456,6 +460,29 @@ FORWARD(IMG_isXCF, 27)
 FORWARD(IMG_isXPM, 28)
 FORWARD(IMG_isXV, 29)
 
+// Patch once, as early as possible: some fixes change values the game stores while building
+// its objects. The game's first SDL_Init call (engine start-up, before any game object
+// exists) is the preferred moment; the first IMG_Load is the fallback.
+static void EnsurePatched(const char* when)
+{
+	static bool done;
+	if(done) return;
+	done = true;
+	Log("Patching at %s", when);
+	if(CfgInt("Enabled", 1)) ApplyPatches();
+	else Log("Disabled in PenumbraUltrawide.ini");
+}
+
+const DWORD IatSDLInit = 0x0063D6F0;	// Penumbra.exe import slot for SDL_Init
+typedef int (__cdecl *SDL_Init_t)(unsigned);
+static SDL_Init_t g_sdlInit;
+
+static int __cdecl Hook_SDLInit(unsigned flags)
+{
+	EnsurePatched("engine start");
+	return g_sdlInit(flags);
+}
+
 typedef void* (__cdecl *IMG_Load_t)(const char*);
 static IMG_Load_t g_imgLoad;
 
@@ -472,9 +499,8 @@ extern "C" void* __cdecl IMG_Load(const char* file)
 			Log("Could not load IMG_Load from %s", path);
 			return NULL;
 		}
-		if(CfgInt("Enabled", 1)) ApplyPatches();
-		else Log("Disabled in PenumbraUltrawide.ini");
 	}
+	EnsurePatched("first image load");
 	return g_imgLoad(file);
 }
 
@@ -490,6 +516,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 		char path[MAX_PATH];
 		_snprintf_s(path, sizeof(path), _TRUNCATE, "%sPenumbraUltrawide.log", g_dir);
 		fopen_s(&g_log, path, "w");
+
+		// The game's code is still encrypted here, but its import table is already filled in.
+		HMODULE sdl = GetModuleHandleA("SDL.dll");
+		g_sdlInit = sdl ? (SDL_Init_t)GetProcAddress(sdl, "SDL_Init") : NULL;
+		if(g_sdlInit && SameBytes(IatSDLInit, &g_sdlInit, 4)) WriteDword(IatSDLInit, (DWORD)&Hook_SDLInit);
 	}
 	return TRUE;
 }

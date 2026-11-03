@@ -18,6 +18,39 @@ screen, about 1.8× too wide at 21:9. With the fix installed:
   will feel faster horizontally than before.
 - Options > Graphics offers modern resolutions, including your desktop resolution. Without
   the fix the list stops at 1920x1200.
+- **High framerate:** the game's logic (player, camera, physics, scripts) normally updates
+  60 times a second, and frames are only drawn after an update, so it never looks smoother
+  than 60 FPS. The fix runs the logic at your monitor's refresh rate (or the `LogicRate` you
+  set), so motion is genuinely smooth at 120/144/165+ Hz. See below for what that involves.
+
+## High framerate
+
+Running the logic faster isn't enough on its own. Some code was written for exactly 60 updates
+a second: it counts updates, or applies a push for a single update. Left alone, at 165 Hz you
+would jump a third as high, doors would feel nearly 3× heavier, and steam would kill nearly 3×
+faster. The fix compensates each of these so the game plays as it does at 60 Hz:
+
+- **Player:** jump take-off; dragging doors, drawers, levers and valves; push/pull kicks and
+  shoves; the screen-edge turn while dragging; the ground grace period (ledge jumps, air
+  steering); the "standing still" check for hiding in shadow; camera and hand smoothing; slope
+  sliding.
+- **Combat:** knockback from enemy hits and explosions; explosion pushes on objects; the
+  spider's leap; the hammer/pickaxe flick threshold; spin on hit and thrown objects; debris
+  from broken objects.
+- **Enemies:** path following; stair stepping; mesh smoothing; how the worm's body trails its
+  head; how long footstep sounds stay audible to them.
+- **Physics:** how long props take to fall asleep after coming to rest; swing-door braking.
+- **Level scripts:** steam, acid, freezing-water and closing-door damage; the refinery fan; the
+  storage-room crane; the worm-nest valve. These are adjusted as the scripts load; the files on
+  disk are untouched.
+
+The rate is set by `LogicRate` in `PenumbraUltrawide.ini`: `0` matches your monitor (default),
+and `60` gives the original behaviour. With "Limit FPS" on (the default), the game draws one
+frame per update, so the framerate equals the logic rate.
+
+Minor differences that remain: the fear "image trail" effect and screen shake are a little
+quicker, scrape and creak sounds start a little more readily, and sliding down slopes that are
+too steep to stand on is slower. If anything feels off, set `LogicRate=60` to compare.
 
 ## Requirements
 
@@ -65,6 +98,12 @@ in memory:
 | Cursor | The crosshair and held-item draws convert the cursor centre from stretched screen space (the space 3D picking uses) into the centred layout. The inventory, notebook, keypad and death menu reuse the crosshair as their mouse pointer (state `Pointer`, already in layout space), so that state is drawn unconverted. A thunk reads the `cPlayer` from `esi` at the call site to check the state. |
 | Mouse | `cMouseSDL::Update` (vtable) scales horizontal relative motion by the aspect factor. The four `afVal * 800` cursor multipliers are pointed at a compensating value. |
 | Resolutions | The 17-entry `gvResolutions` table is rewritten in place. |
+| Logic rate | `cLogicTimer::GetStepSize` is replaced. On the first call (during startup) it sets the timer's milliseconds-per-tick to `1000 / LogicRate`. The tick schedule and every step size, including ones the game caches at startup, follow from that one field. |
+| Tick compensations (`HighFramerate.cpp`) | Each 60 Hz assumption becomes a constant scaled by rate/60 or 60/rate. Shared x87 constants are handled by pointing the one instruction at a scaled copy. Tick counts are patched as immediates. One-tick forces and torques go through small stubs that pass a scaled copy of the vector. Newton's freeze-step count is scaled at its import. Level scripts are rewritten in the buffer that `cSqScript::LoadCharBuffer` returns. If any of these sites doesn't match, the game stays at 60 Hz. |
+
+The DLL patches at the game's first `SDL_Init` call, hooked through the import table in
+`DllMain`. That is before any game object is built, so values stored by constructors are
+covered. The first `IMG_Load` is the fallback.
 
 Before patching, the DLL checks the exact bytes at every patch site. On any other build it
 logs the mismatch and leaves the game untouched.

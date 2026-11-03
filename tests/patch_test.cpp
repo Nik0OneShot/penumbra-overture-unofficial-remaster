@@ -9,6 +9,7 @@
 #include <GL/gl.h>
 #include <stdio.h>
 #include <math.h>
+#include <string>
 
 typedef unsigned char u8;
 static int g_fail;
@@ -37,6 +38,27 @@ static void __fastcall CapShort(void*, void*, void*, const float* p) { memcpy(cP
 static void __fastcall CapTex(void*, void*, void*, const float* p, const float* s, const float*) { memcpy(cPos, p, 12); memcpy(cSize, s, 12); ++cCalls; }
 static void __fastcall CapOrtho(void*, void*, const float*, float, float) { ++cCalls; }
 static void __fastcall CapMouse(void* m, void*) { *(float*)((u8*)m + 0x2C) = 10; *(float*)((u8*)m + 0x30) = 10; ++cCalls; }
+static int g_capFrames;
+static void __cdecl CapFreeze(void*, float, float, int frames) { g_capFrames = frames; }
+static float g_capVec[3]; static void* g_capThis;
+static void __fastcall CapVec(void* self, void*, const float* v) { g_capThis = self; memcpy(g_capVec, v, 12); }
+
+// Stand-in for cSqScript::LoadCharBuffer: reads g_fakeFile into a buffer from the game's new[]
+static char g_gameDir[MAX_PATH];
+static const char* g_fakeFile;
+static size_t g_fakeOrigLen;
+static char* g_fakeLastBuf;
+static char* __fastcall FakeLoadCharBuffer(void*, void*, const void*, int* len)
+{
+	FILE* f; fopen_s(&f, g_fakeFile, "rb");
+	if(!f) return NULL;
+	fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+	typedef void* (__cdecl *New_t)(size_t);
+	char* buf = (char*)((New_t)GetProcAddress(GetModuleHandleA("msvcr71.dll"), "??_U@YAPAXI@Z"))(n);
+	fread(buf, 1, n, f); fclose(f);
+	*len = n; g_fakeOrigLen = n; g_fakeLastBuf = buf;
+	return buf;
+}
 
 typedef void (__fastcall *Long_t)(void*, void*, void*, const float*, const float*, const float*, int, int, float);
 typedef void (__fastcall *Short_t)(void*, void*, void*, const float*);
@@ -75,7 +97,8 @@ static bool MakeGLContext()
 
 int main(int argc, char** argv)
 {
-	if(argc < 3) { printf("usage: patch_test <dump> <jpg>\n"); return 2; }
+	if(argc < 4) { printf("usage: patch_test <dump> <jpg> <game dir>\n"); return 2; }
+	strcpy_s(g_gameDir, argv[3]);
 	InitGfx();
 
 	// 1. Map the dump at the game's image base
@@ -83,12 +106,43 @@ int main(int argc, char** argv)
 	if(!f) { printf("cannot open dump\n"); return 2; }
 	fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
 	u8* img = (u8*)VirtualAlloc((void*)0x400000, n, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-	if(img != (u8*)0x400000) { printf("could not map at 0x400000 (%p)\n", img); return 2; }
+	if(img != (u8*)0x400000)
+	{
+		// Address-space randomisation sometimes puts a heap there first; a fresh process usually won't.
+		char tries[8] = "0";
+		GetEnvironmentVariableA("UWTEST_TRIES", tries, sizeof(tries));
+		int t = atoi(tries);
+		if(t >= 10) { printf("could not map at 0x400000 after %d tries\n", t); return 2; }
+		sprintf_s(tries, "%d", t + 1);
+		SetEnvironmentVariableA("UWTEST_TRIES", tries);
+		STARTUPINFOA si = { sizeof(si) }; PROCESS_INFORMATION pi;
+		if(!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) return 2;
+		WaitForSingleObject(pi.hProcess, INFINITE);
+		DWORD rc = 2; GetExitCodeProcess(pi.hProcess, &rc);
+		return (int)rc;
+	}
 	fread(img, 1, n, f); fclose(f);
 
-	// 2. Load the proxy and trigger patching through IMG_Load
+	// The game's CRT and Newton are loaded in the real process; the high-framerate checks
+	// look for them, so load them and point the dump's Newton import at the real export.
+	HMODULE crt = LoadLibraryA("msvcr71.dll");
+	HMODULE newton = LoadLibraryA("Newton.dll");
+	CHECK(crt && newton, "game CRT and Newton load");
+	FARPROC setFreeze = newton ? GetProcAddress(newton, "NewtonBodySetFreezeTreshold") : NULL;
+	*(FARPROC*)0x63D4CC = setFreeze;
+	// Same for SDL_Init: the proxy hooks it at load time to patch before game objects exist
+	HMODULE sdl = LoadLibraryA("SDL.dll");
+	FARPROC sdlInit = sdl ? GetProcAddress(sdl, "SDL_Init") : NULL;
+	*(FARPROC*)0x63D6F0 = sdlInit;
+
+	// 2. Load the proxy; patching happens at the game's first SDL_Init
 	HMODULE dll = LoadLibraryA("SDL_image.dll");
 	CHECK(dll != NULL, "proxy SDL_image.dll loads");
+	CHECK(dll && *(FARPROC*)0x63D6F0 != sdlInit, "SDL_Init import hooked at DLL load (code still encrypted then)");
+	CHECK(*(u8*)0x4CE1A0 != 0xE9, "nothing patched before SDL_Init");
+	typedef int (__cdecl *SDL_Init_t)(unsigned);
+	(*(SDL_Init_t*)0x63D6F0)(0);
+	CHECK(*(u8*)0x4CE1A0 == 0xE9, "first SDL_Init applies the patches");
 	typedef void* (__cdecl *IMG_Load_t)(const char*);
 	IMG_Load_t imgLoad = (IMG_Load_t)GetProcAddress(dll, "IMG_Load");
 	void* surf = imgLoad ? imgLoad(argv[2]) : NULL;
@@ -189,6 +243,185 @@ int main(int argc, char** argv)
 		float rx = *(float*)(mouse + 0x2C), ry = *(float*)(mouse + 0x30);
 		CHECK(cCalls == 1 && Near(rx, 10 * K) && ry == 10, "mouse rel x scaled by %.3f (x=%.2f y=%.2f)", K, rx, ry);
 		CHECK(Near(*mul * K, 800), "in-world cursor multiplier = 800/k (%.2f)", *mul);
+	}
+
+	// 8b. Logic rate: the first GetStepSize call retunes the live timer to the monitor rate
+	{
+		DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+		EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm);
+		int rate = (int)dm.dmDisplayFrequency; if(rate < 60) rate = 60; if(rate > 360) rate = 360;
+		double timer[4] = { 12345.0, 1000.0 / 60, 0, 0 };
+		float step = ((float (__fastcall*)(void*))0x50F1E0)(timer);
+		CHECK(Near(step * rate, 1) && fabs(timer[1] - 1000.0 / rate) < 1e-9 && timer[0] == 12345.0,
+			  "logic timer retuned to %d Hz (step %.5f s, tick %.3f ms)", rate, step, timer[1]);
+		typedef float (__fastcall *GameStep_t)(void*);
+		void* game[0x40] = {}; *(double**)((u8*)game + *(u8*)(0x4A4FD0 + 2)) = timer;
+		CHECK(Near(((GameStep_t)0x4A4FD0)(game) * rate, 1), "cGame::GetStepSize (used by game code) returns the new step");
+	}
+
+	// 8c. Level scripts are rewritten as they load
+	{
+		DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+		EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm);
+		int rate = (int)dm.dmDisplayFrequency; if(rate < 60) rate = 60; if(rate > 360) rate = 360;
+
+		PutJmp(0x513730, &FakeLoadCharBuffer);
+		typedef char* (__fastcall *Load_t)(void*, void*, const void*, int*);
+		Load_t load = (Load_t)CallTarget(0x51396F);
+		CHECK(inDll((DWORD)load), "script load call redirected");
+
+		static const char* files[] = { "level01_17_worm_nest.hps", "level01_11_new_storage_room.hps",
+									   "level01_04_old_storage.hps", "level01_15_icecave.hps", "level01_14_refinery.hps" };
+		char expect[5][96];
+		sprintf_s(expect[0], "if(fSpeed > %.6ff)", 0.3 * 60 / rate);
+		sprintf_s(expect[1], "float fTimeStep = 1.0f/%d.0f;", rate);
+		sprintf_s(expect[2], "GivePlayerDamage(2.3f*%.6ff, \"BloodSplash\");", 60.0 / rate);
+		sprintf_s(expect[3], "lDuringWaterCount %% %d != 0", (int)(3 * rate / 60.0f + 0.5f));
+		sprintf_s(expect[4], "GetLocalVar(\"breakfancount\") == %d)", rate);
+		for(int i = 0; i < 5; ++i)
+		{
+			char path[MAX_PATH]; sprintf_s(path, "%s\\maps\\%s", g_gameDir, files[i]);
+			g_fakeFile = path;
+			u8 name[0x1C] = {}; char nameBuf[64]; sprintf_s(nameBuf, "maps/%s", files[i]);
+			*(char**)(name + 4) = nameBuf; *(DWORD*)(name + 0x14) = (DWORD)strlen(nameBuf); *(DWORD*)(name + 0x18) = 63;
+			int len = 0;
+			char* text = load(NULL, NULL, name, &len);
+			std::string s(text ? text : "", text ? len : 0);
+			CHECK(text && s.find(expect[i]) != std::string::npos, "%s rewritten (contains '%s')", files[i], expect[i]);
+		}
+		// Untouched script: same buffer back
+		char path[MAX_PATH]; sprintf_s(path, "%s\\maps\\level01_01_outside.hps", g_gameDir);
+		g_fakeFile = path;
+		u8 name[0x1C] = {}; strcpy_s((char*)name + 4, 16, "outside.hps"); *(DWORD*)(name + 0x18) = 15;
+		int len = 0;
+		char* text = load(NULL, NULL, name, &len);
+		CHECK(text == g_fakeLastBuf && len == (int)g_fakeOrigLen, "other scripts load unchanged");
+
+		// Engine constants
+		double slope = **(double**)(0x4B47DD + 2);
+		CHECK(inDll(*(DWORD*)(0x4B47DD + 2)) && fabs(slope + 0.15 * 60 / rate) < 1e-9, "slope threshold scaled (%.4f)", slope);
+		CHECK(*(u8*)(0x43DA27 + 1) == (u8)(20 * rate / 60.0f + 0.5f), "door PID window %d ticks", *(u8*)(0x43DA27 + 1));
+
+		void* probe = (void*)CallTarget(0x4B3D9A);
+		float sumSq = 4.0f, reach = 0;
+		__asm {
+			sub esp, 30h
+			fld sumSq
+			call probe
+			fld dword ptr [esp+24h]
+			fstp reach
+			add esp, 30h
+		}
+		CHECK(inDll((DWORD)probe) && Near(reach, 2.0f * rate / 60.0f), "stair probe reach x%.2f (%.3f)", rate / 60.0f, reach);
+
+		// Newton freeze frames: catch the call where it reaches Newton
+		PutJmp((DWORD)setFreeze, &CapFreeze);
+		typedef void (__cdecl *Freeze_t)(void*, float, float, int);
+		CHECK(inDll(*(DWORD*)0x63D4CC), "Newton freeze import hooked");
+		(*(Freeze_t*)0x63D4CC)((void*)1, 0.1f, 0.1f, 10);
+		CHECK(g_capFrames == (int)(10 * rate / 60.0f + 0.5f), "prop freeze delay 10 -> %d physics steps", g_capFrames);
+	}
+
+	// 8d. Tick compensations
+	{
+		DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+		EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm);
+		int rate = (int)dm.dmDisplayFrequency; if(rate < 60) rate = 60; if(rate > 360) rate = 360;
+		float s = rate / 60.0f;
+		auto ticks = [&](int n) { return (int)(n * s + 0.5f); };
+
+		CHECK(Near(**(float**)(0x48E83B + 2), 100 * s), "door drag force x%.2f (%.1f)", s, **(float**)(0x48E83B + 2));
+		CHECK(fabs(**(float**)(0x48DCCB + 2) - 0.01f / s) < 1e-7, "hide 'standing still' threshold /%.2f", s);
+		CHECK(fabs(**(float**)(0x41D637 + 2) - 1e-5f / (s * s)) < 1e-10, "worm movement threshold /%.2f^2", s);
+		CHECK(*(float*)0x63DA48 == 300.0f && *(float*)0x643558 == 0.01f, "shared game constants untouched");
+		CHECK(*(int*)0x483C7B == ticks(25) && *(int*)0x488F54 == ticks(16) && *(int*)0x40717A == ticks(150) && *(int*)0x41DDC6 == ticks(20),
+			  "tick counts scaled (ground grace %d, hand lag %d, path samples %d, worm %d)", *(int*)0x483C7B, *(int*)0x488F54, *(int*)0x40717A, *(int*)0x41DDC6);
+		CHECK(Near(*(float*)0x480EE1 * rate, 1), "sound trigger life = 1 tick (%.5f s)", *(float*)0x480EE1);
+
+		// Jump: stub replaces "mov edx,[edi+80h]" between a cmp and its jne
+		void* jump = (void*)CallTarget(0x48097C);
+		float state[0x30] = {}; state[0x80 / 4] = 350.0f;
+		void* pState = state; DWORD edxOut; u8 zf;
+		__asm {
+			push edi
+			mov edi, pState
+			xor eax, eax
+			cmp eax, eax			// ZF = 1
+			call jump
+			setz zf
+			mov edxOut, edx
+			pop edi
+		}
+		CHECK(Near(*(float*)&edxOut, 350 * s) && zf == 1, "jump force x%.2f (%.1f), flags kept", s, *(float*)&edxOut);
+
+		// Knockback / spider leap: one-tick character force, original vector untouched
+		PutJmp(0x4B1BF0, &CapVec);
+		typedef void (__fastcall *Force_t)(void*, void*, const float*);
+		float f[3] = { 1, 2, 3 };
+		((Force_t)CallTarget(0x41A88E))((void*)0x55, 0, f);
+		CHECK(g_capThis == (void*)0x55 && Near(g_capVec[0], s) && Near(g_capVec[2], 3 * s) && f[0] == 1,
+			  "spider leap force x%.2f, game's vector untouched", s);
+
+		// Torque stub at a "call [edx+80h]" site
+		void* torque = (void*)CallTarget(0x441D9D);
+		void* vtbl[0x30] = {}; vtbl[0x80 / 4] = (void*)&CapVec; vtbl[0x78 / 4] = (void*)&CapVec;
+		void* pVtbl = vtbl; float tq[3] = { 2, 4, 6 }; float* pTq = tq;
+		DWORD espBefore, espAfter;
+		__asm {
+			mov espBefore, esp
+			push pTq
+			mov ecx, 0x66
+			mov edx, pVtbl
+			call torque			// AddTorque pops the pointer, like the original call
+			mov espAfter, esp
+		}
+		CHECK(espBefore == espAfter && g_capThis == (void*)0x66 && Near(g_capVec[1], 4 * s) && tq[1] == 4,
+			  "hit/throw torque x%.2f, stack balanced", s);
+
+		// Explosion stub: vector at [esp+40h..48h], pointer at [esp], y still on the FPU stack
+		void* expl = (void*)CallTarget(0x402AFF);
+		float y = 5; DWORD ecxOut; float ex[3];
+		__asm {
+			push esi
+			sub esp, 50h
+			lea eax, [esp+40h]
+			mov [esp], eax
+			mov dword ptr [esp+40h], 3F800000h	// x = 1
+			mov dword ptr [esp+48h], 40400000h	// z = 3
+			mov esi, 77h
+			fld y
+			call expl
+			mov ecxOut, ecx
+			mov eax, [esp]
+			mov edx, [eax]
+			mov ex, edx
+			mov edx, [eax+4]
+			mov ex+4, edx
+			mov edx, [eax+8]
+			mov ex+8, edx
+			add esp, 50h
+			pop esi
+		}
+		CHECK(ecxOut == 0x77 && Near(ex[0], s) && Near(ex[1], 5 * s) && Near(ex[2], 3 * s), "explosion push x%.2f", s);
+
+		// Debris stub: vector at [esp+34h..3Ch], pointer at [esp], tail-calls [eax+78h]
+		void* brk = (void*)CallTarget(0x430168);
+		__asm {
+			mov espBefore, esp
+			sub esp, 40h
+			lea eax, [esp+34h]
+			mov [esp], eax
+			mov dword ptr [esp+34h], 3F800000h	// x = 1
+			mov dword ptr [esp+3Ch], 40400000h	// z = 3
+			fld y
+			mov ecx, 88h
+			mov eax, pVtbl
+			call brk			// AddForce pops the pointer
+			add esp, 3Ch
+			mov espAfter, esp
+		}
+		CHECK(espBefore == espAfter && g_capThis == (void*)0x88 && Near(g_capVec[1], 5 * s) && Near(g_capVec[2], 3 * s),
+			  "debris force x%.2f, stack balanced", s);
 	}
 
 	// 9. Ortho: post effects pass through; UI pass gets the centred projection

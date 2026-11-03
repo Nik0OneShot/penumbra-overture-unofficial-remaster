@@ -20,6 +20,20 @@ if (Test-Path $orig) {
     Write-Host "Backed up the original SDL_image.dll as SDL_image_orig.dll"
 }
 Copy-Item "$PSScriptRoot\dist\SDL_image.dll" $dll -Force
-if (-not (Test-Path $ini)) { Copy-Item "$PSScriptRoot\dist\PenumbraUltrawide.ini" $ini }
+if (-not (Test-Path $ini)) {
+    Copy-Item "$PSScriptRoot\dist\PenumbraUltrawide.ini" $ini
+} else {
+    # Keep the user's values; append settings added since their copy (with their comments).
+    $have = Get-Content $ini
+    $pending = @()
+    foreach ($line in Get-Content "$PSScriptRoot\dist\PenumbraUltrawide.ini") {
+        if ($line -match '^\s*;') { $pending += $line; continue }
+        if ($line -match '^\s*([A-Za-z0-9_]+)\s*=' -and -not ($have -match "^\s*$($Matches[1])\s*=")) {
+            Add-Content $ini ($pending + $line)
+            Write-Host "Added new setting: $line"
+        }
+        $pending = @()
+    }
+}
 Write-Host "Installed to $GameDir"
 Write-Host "After launching, PenumbraUltrawide.log in that folder says whether the patches applied."
