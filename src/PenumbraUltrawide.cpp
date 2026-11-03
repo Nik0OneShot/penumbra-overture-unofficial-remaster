@@ -19,6 +19,8 @@
 #include "Patch.h"
 #include <intrin.h>
 #include <GL/gl.h>
+#include <math.h>
+#include <share.h>
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -61,6 +63,21 @@ namespace A {
 	// gvResolutions[17] (cVector2l) used by the options menu
 	const DWORD Resolutions     = 0x00692CC0;
 	const int   ResolutionNum   = 17;
+
+	// cFrustum::SetViewProjMatrix: mOriginBV.SetSize(near*2), the box around the camera
+	const DWORD OriginBoxSize   = 0x005045CD;	// fld [esp+78h] (near); mov edx, [esp+74h]; fadd st0, st0
+	// cRenderer3D::UpdateRenderList: fog-culling box = fogEnd*2 / cos(fov*aspect*0.5)
+	const DWORD FogCornerCos    = 0x004F6D83;	// fmul [0.5]; fcos   (edi = cCamera3D: mfFOV +10h, mfAspect +14h)
+
+	// cSectorVisibilityContainer::SearchSector: is this doorway (portal) in view?
+	const DWORD PortalTestCall  = 0x00523E60;	// call IntersectionBV(&portal->mBV, parentSet); ebp = cPortal
+	const DWORD IntersectionBV  = 0x00523310;
+	const DWORD IntersectionFrustumTest = 0x00523395;	// add ecx, 26Ch; call cFrustum::CollideBoundingVolume
+	const DWORD FrustumCollideBV = 0x00504170;
+	const DWORD ContainerFrustum = 0x26C;	// cSectorVisibilityContainer::mFrustum
+	const DWORD FrustumPlanes    = 0x2D0;	// cPlanef[6] (a, b, c, d, normal): left, right, bottom, top, near, far
+	const DWORD FrustumSphereRadius = 0x378;
+	const DWORD PortalBV         = 0x90;	// cPortal::mBV; cPortal::mlId at +4
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -261,6 +278,113 @@ static void __fastcall Call_DrawTextureStretch(void* helper, void* edx, void* te
 	((DrawTexture_t)A::DrawTexture)(helper, edx, tex, pos, size, col);
 }
 
+// The engine keeps a box around the camera, sized near*2, and uses it to pick Z-fail stencil
+// shadows when the near plane might be inside a shadow volume. That box only reaches the near
+// plane's corners up to about 4:3. Wider, a side corner can sit in a wall's shadow unnoticed,
+// and that strip of the screen renders black. Size the box to contain the whole near plane.
+static float __cdecl NearPlaneBoxSize(float nearPlane, float fov, float aspect)
+{
+	float t = tanf(fov * 0.5f);
+	return 2.0f * nearPlane * sqrtf(1.0f + t * t * (1.0f + aspect * aspect));
+}
+
+// Replaces "fld [esp+78h]; mov edx, [esp+74h]; fadd st0, st0" (10 bytes).
+__declspec(naked) static void Stub_OriginBoxSize()
+{
+	__asm
+	{
+		push eax
+		push ecx
+		push dword ptr [esp+8Ch]	// aspect: the game's [esp+80h]
+		push dword ptr [esp+8Ch]	// fov:    the game's [esp+7Ch]
+		push dword ptr [esp+8Ch]	// near:   the game's [esp+78h]
+		call NearPlaneBoxSize
+		add esp, 0Ch
+		pop ecx
+		pop eax
+		mov edx, [esp+78h]			// the replaced "mov edx, [esp+74h]"
+		ret
+	}
+}
+
+// Fog culling keeps what lies within fogEnd*2/cos(fov*aspect/2) of the camera. From about
+// 2.6:1 the cosine goes negative and everything is culled. Use the vanilla value where it is
+// valid and at least as generous as the real view corner; otherwise use the real corner.
+static float __cdecl FogCornerCos(float fov, float aspect)
+{
+	float t = tanf(fov * 0.5f);
+	float exact = 1.0f / sqrtf(1.0f + t * t * (1.0f + aspect * aspect));
+	float vanilla = cosf(fov * aspect * 0.5f);
+	return (vanilla > 0 && vanilla < exact) ? vanilla : exact;
+}
+
+// Replaces "fmul [0.5]; fcos" (8 bytes). On entry st0 = fov*aspect, st1 = fogEnd*2.
+static float g_fogEnd2;
+__declspec(naked) static void Stub_FogCornerCos()
+{
+	__asm
+	{
+		fstp st(0)
+		fstp g_fogEnd2				// keep the x87 stack empty across the C call
+		push eax
+		push ecx
+		push edx
+		push dword ptr [edi+14h]	// mfAspect
+		push dword ptr [edi+10h]	// mfFOV
+		call FogCornerCos
+		add esp, 8
+		pop edx
+		pop ecx
+		pop eax
+		fld g_fogEnd2
+		fxch st(1)					// st0 = result, st1 = fogEnd*2, as after fcos
+		ret
+	}
+}
+
+// A room is only drawn if a doorway (portal quad) leading to it is in view. Some levels'
+// room meshes reach a little past their doorway quad, so near a doorway you can see into the
+// next room while the quad itself is just outside the view. At 4:3 that never happens on
+// screen; at 21:9 the room shows up black at the edge. Count doorways within a margin outside
+// the view as visible; everything inside the room is still culled with the exact view.
+static float g_portalMargin;	// metres; 0 = off
+static int g_portalRescueLogs;
+
+typedef bool (__fastcall *IntersectionBV_t)(void*, void*, void*, void*);
+
+static bool __fastcall Call_PortalTest(void* container, void* edx, void* bv, void* parentSet)
+{
+	IntersectionBV_t test = (IntersectionBV_t)A::IntersectionBV;
+	bool exact = test(container, edx, bv, parentSet);
+	if(exact || g_portalMargin <= 0) return exact;
+
+	u8* frustum = (u8*)container + A::ContainerFrustum;
+	float saved[6];
+	for(int i = 0; i < 5; ++i)	// left, right, bottom, top, near
+	{
+		float* d = (float*)(frustum + A::FrustumPlanes + i * 0x1C + 0xC);
+		saved[i] = *d;
+		*d += g_portalMargin;
+	}
+	float* radius = (float*)(frustum + A::FrustumSphereRadius);
+	saved[5] = *radius;
+	*radius += g_portalMargin;
+
+	bool visible = test(container, edx, bv, parentSet);
+
+	for(int i = 0; i < 5; ++i) *(float*)(frustum + A::FrustumPlanes + i * 0x1C + 0xC) = saved[i];
+	*radius = saved[5];
+
+	if(visible && g_portalRescueLogs < 40)
+	{
+		++g_portalRescueLogs;
+		const float* eye = (const float*)(frustum + 0x14);
+		Log("  doorway %d drawn thanks to the margin (camera %.1f %.1f %.1f)",
+			*(int*)((u8*)bv - A::PortalBV + 4), eye[0], eye[1], eye[2]);
+	}
+	return visible;
+}
+
 //////////////////////////////////////////////////////////////////////////
 // Patching
 
@@ -351,6 +475,16 @@ static bool VerifyGame()
 	}
 	ok &= Expect(A::Const800, &f800, 4, "800.0f constant");
 	ok &= Expect(A::Resolutions, firstRes, sizeof(firstRes), "resolution table");
+	static const u8 originBox[] = { 0xD9, 0x44, 0x24, 0x78, 0x8B, 0x54, 0x24, 0x74, 0xDC, 0xC0 };
+	ok &= Expect(A::OriginBoxSize, originBox, sizeof(originBox), "frustum origin box");
+	static const u8 fogCos[] = { 0xD8, 0x0D, 0x14, 0xDE, 0x63, 0x00, 0xD9, 0xFF };
+	ok &= Expect(A::FogCornerCos, fogCos, sizeof(fogCos), "fog culling cosine");
+	static const u8 portalBV[] = { 0x8D, 0x95, 0x90, 0x00, 0x00, 0x00, 0x52, 0x8B, 0xCE };	// lea edx,[ebp+90h]; push edx; mov ecx,esi
+	ok &= Expect(A::PortalTestCall - 9, portalBV, sizeof(portalBV), "portal test arguments")
+		&& ExpectCall(A::PortalTestCall, A::IntersectionBV, "portal test call");
+	static const u8 frustumAdd[] = { 0x81, 0xC1, 0x6C, 0x02, 0x00, 0x00 };	// add ecx, 26Ch
+	ok &= Expect(A::IntersectionFrustumTest, frustumAdd, sizeof(frustumAdd), "visibility frustum")
+		&& ExpectCall(A::IntersectionFrustumTest + 6, A::FrustumCollideBV, "visibility frustum test");
 	return ok;
 }
 
@@ -418,6 +552,15 @@ static void ApplyPatches()
 		PatchResolutions();
 		Log("  options menu resolutions updated");
 	}
+
+	u8 call[10] = { 0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90 };
+	*(DWORD*)(call + 1) = (DWORD)&Stub_OriginBoxSize - (A::OriginBoxSize + 5);
+	Write(A::OriginBoxSize, call, 10);
+	*(DWORD*)(call + 1) = (DWORD)&Stub_FogCornerCos - (A::FogCornerCos + 5);
+	Write(A::FogCornerCos, call, 8);
+	g_portalMargin = (float)CfgInt("DoorwayMargin", 2);
+	if(g_portalMargin > 0) RedirectCall(A::PortalTestCall, &Call_PortalTest);
+	Log("  wide-view shadow and fog culling fixed; doorway margin %.0f m", g_portalMargin);
 	int rate = ChooseLogicRate();
 	if(rate != 60)
 	{
@@ -515,7 +658,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 
 		char path[MAX_PATH];
 		_snprintf_s(path, sizeof(path), _TRUNCATE, "%sPenumbraUltrawide.log", g_dir);
-		fopen_s(&g_log, path, "w");
+		g_log = _fsopen(path, "w", _SH_DENYNO);	// readable while the game runs
 
 		// The game's code is still encrypted here, but its import table is already filled in.
 		HMODULE sdl = GetModuleHandleA("SDL.dll");

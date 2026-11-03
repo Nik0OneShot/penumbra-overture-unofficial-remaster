@@ -40,6 +40,14 @@ static void __fastcall CapOrtho(void*, void*, const float*, float, float) { ++cC
 static void __fastcall CapMouse(void* m, void*) { *(float*)((u8*)m + 0x2C) = 10; *(float*)((u8*)m + 0x30) = 10; ++cCalls; }
 static int g_capFrames;
 static void __cdecl CapFreeze(void*, float, float, int frames) { g_capFrames = frames; }
+// Stand-in for cSectorVisibilityContainer::IntersectionBV: "visible" once the frustum's left
+// plane has been pushed out to at least g_fakeNeedLeftD
+static int g_fakeCalls; static float g_fakeNeedLeftD;
+static bool __fastcall FakePortalTest(void* container, void*, void*, void*)
+{
+	++g_fakeCalls;
+	return *(float*)((u8*)container + 0x26C + 0x2D0 + 0xC) >= g_fakeNeedLeftD;
+}
 static float g_capVec[3]; static void* g_capThis;
 static void __fastcall CapVec(void* self, void*, const float* v) { g_capThis = self; memcpy(g_capVec, v, 12); }
 
@@ -78,6 +86,27 @@ static void CallCrosshair(void* player, void* drawer, void* obj, float* pos)
 		call fn
 		pop esi
 	}
+}
+
+// The fog-culling stub at its call site: edi = camera, st0 = fov*aspect, st1 = fogEnd*2
+static float CallFogStub(float fov, float aspect, float* fogEnd2Out)
+{
+	void* fn = (void*)CallTarget(0x4F6D83);
+	float cam[8] = {}; cam[4] = fov; cam[5] = aspect;	// mfFOV +10h, mfAspect +14h
+	float* pCam = cam;
+	float prod = fov * aspect, two = 40.0f, r = 0, f2 = 0;
+	__asm {
+		push edi
+		mov edi, pCam
+		fld two
+		fld prod
+		call fn
+		fstp r
+		fstp f2
+		pop edi
+	}
+	*fogEnd2Out = f2;
+	return r;
 }
 
 static HGLRC g_rc;
@@ -422,6 +451,63 @@ int main(int argc, char** argv)
 		}
 		CHECK(espBefore == espAfter && g_capThis == (void*)0x88 && Near(g_capVec[1], 5 * s) && Near(g_capVec[2], 3 * s),
 			  "debris force x%.2f, stack balanced", s);
+	}
+
+	// 8e. Wide-view culling: camera near-plane box and fog-culling box
+	{
+		void* origin = (void*)CallTarget(0x5045CD);
+		CHECK(inDll((DWORD)origin) && *(u8*)(0x5045CD + 5) == 0x90, "frustum origin box patched");
+		float nearP = 0.05f, fov = 1.2217305f /* 70 deg */, aspect = 3440.0f / 1440, farP = 100.0f;
+		float box = 0; DWORD eaxOut, edxOut;
+		__asm {
+			sub esp, 90h
+			mov eax, nearP
+			mov [esp+78h], eax
+			mov eax, fov
+			mov [esp+7Ch], eax
+			mov eax, aspect
+			mov [esp+80h], eax
+			mov eax, farP
+			mov [esp+74h], eax
+			mov eax, 12345678h
+			call origin
+			fstp box
+			mov eaxOut, eax
+			mov edxOut, edx
+			add esp, 90h
+		}
+		float t = tanf(fov * 0.5f), corner = nearP * sqrtf(1 + t * t * (1 + aspect * aspect));
+		CHECK(Near(box * 1000, 2 * corner * 1000) && box > 2 * nearP * 2 && eaxOut == 0x12345678 && *(float*)&edxOut == farP,
+			  "near-plane box %.4f covers 21:9 corners (vanilla %.4f), registers kept", box, 2 * nearP);
+
+		CHECK(inDll(CallTarget(0x4F6D83)), "fog culling cosine patched");
+		float f2 = 0;
+		float c219 = CallFogStub(1.2217305f, 3440.0f / 1440, &f2);
+		CHECK(Near(c219, cosf(1.2217305f * (3440.0f / 1440) * 0.5f)) && f2 == 40.0f, "fog box at 21:9 unchanged from vanilla (cos %.4f), x87 stack intact", c219);
+		float c329 = CallFogStub(1.2217305f, 5120.0f / 1440, &f2);
+		CHECK(c329 > 0.2f && c329 < 1.0f, "fog box at 32:9 valid (cos %.4f; vanilla would be %.4f)", c329, cosf(1.2217305f * (5120.0f / 1440) * 0.5f));
+	}
+
+	// 8f. Doorway (portal) test: retried with the view widened by the margin, then restored
+	{
+		CHECK(inDll(CallTarget(0x523E60)), "doorway visibility test redirected");
+		PutJmp(0x523310, &FakePortalTest);
+		static u8 container[0x700]; static u8 portal[0x120];
+		*(int*)(portal + 4) = 7;
+		float* leftD = (float*)(container + 0x26C + 0x2D0 + 0xC);
+		float* radius = (float*)(container + 0x26C + 0x378);
+		*leftD = 0; *radius = 10;
+		typedef bool (__fastcall *Test_t)(void*, void*, void*, void*);
+		Test_t portalTest = (Test_t)CallTarget(0x523E60);
+		g_fakeCalls = 0; g_fakeNeedLeftD = 1.5f;
+		bool vis = portalTest(container, 0, portal + 0x90, NULL);
+		CHECK(vis && g_fakeCalls == 2 && *leftD == 0 && *radius == 10, "doorway just outside the view is drawn; view restored afterwards");
+		g_fakeCalls = 0; g_fakeNeedLeftD = -1;
+		vis = portalTest(container, 0, portal + 0x90, NULL);
+		CHECK(vis && g_fakeCalls == 1, "doorway in view: exact test only");
+		g_fakeCalls = 0; g_fakeNeedLeftD = 5.0f;
+		vis = portalTest(container, 0, portal + 0x90, NULL);
+		CHECK(!vis && g_fakeCalls == 2 && *leftD == 0, "doorway far outside the view stays hidden");
 	}
 
 	// 9. Ortho: post effects pass through; UI pass gets the centred projection

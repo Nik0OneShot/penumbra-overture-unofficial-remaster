@@ -18,6 +18,10 @@ screen, about 1.8× too wide at 21:9. With the fix installed:
   will feel faster horizontally than before.
 - Options > Graphics offers modern resolutions, including your desktop resolution. Without
   the fix the list stops at 1920x1200.
+- Things at the far left and right of a wide view no longer turn black. The engine picks its
+  stencil-shadow method from a box around the camera that only covers about a 4:3 view, so
+  shadows went wrong at the screen edges. On very wide screens (about 2.6:1 and up, e.g. 32:9),
+  fog culling no longer hides everything in foggy levels.
 - **High framerate:** the game's logic (player, camera, physics, scripts) normally updates
   60 times a second, and frames are only drawn after an update, so it never looks smoother
   than 60 FPS. The fix runs the logic at your monitor's refresh rate (or the `LogicRate` you
@@ -98,6 +102,8 @@ in memory:
 | Cursor | The crosshair and held-item draws convert the cursor centre from stretched screen space (the space 3D picking uses) into the centred layout. The inventory, notebook, keypad and death menu reuse the crosshair as their mouse pointer (state `Pointer`, already in layout space), so that state is drawn unconverted. A thunk reads the `cPlayer` from `esi` at the call site to check the state. |
 | Mouse | `cMouseSDL::Update` (vtable) scales horizontal relative motion by the aspect factor. The four `afVal * 800` cursor multipliers are pointed at a compensating value. |
 | Resolutions | The 17-entry `gvResolutions` table is rewritten in place. |
+| Wide-view culling | `cFrustum::SetViewProjMatrix` sizes `mOriginBV` (used to choose Z-fail shadows) to contain the whole near plane for the actual FOV and aspect, instead of `near*2`. The fog-culling cosine in `cRenderer3D::UpdateRenderList` falls back to the exact view-corner value where `cos(fov*aspect/2)` stops being valid. |
+| Doorway margin | Rooms are only drawn when a doorway (portal quad) into them is in view. Some room meshes reach past their quad, so at 21:9 you could see into a room whose quad was just off screen, and it showed black. The portal test in `cSectorVisibilityContainer::SearchSector` is retried with the frustum's side and near planes pushed out by `DoorwayMargin` metres (default 2), then restored. Objects are still culled with the exact view. Rescued doorways are logged. |
 | Logic rate | `cLogicTimer::GetStepSize` is replaced. On the first call (during startup) it sets the timer's milliseconds-per-tick to `1000 / LogicRate`. The tick schedule and every step size, including ones the game caches at startup, follow from that one field. |
 | Tick compensations (`HighFramerate.cpp`) | Each 60 Hz assumption becomes a constant scaled by rate/60 or 60/rate. Shared x87 constants are handled by pointing the one instruction at a scaled copy. Tick counts are patched as immediates. One-tick forces and torques go through small stubs that pass a scaled copy of the vector. Newton's freeze-step count is scaled at its import. Level scripts are rewritten in the buffer that `cSqScript::LoadCharBuffer` returns. If any of these sites doesn't match, the game stays at 60 Hz. |
 
