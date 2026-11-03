@@ -1,0 +1,15 @@
+# Local copy of the game (Frictional Games' files: never commit)
+game/
+
+# Build intermediates (dist/ holds the prebuilt DLL and is committed)
+src/obj/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Memory snapshots of the running game contain its code
+*.bin
+
+*.log

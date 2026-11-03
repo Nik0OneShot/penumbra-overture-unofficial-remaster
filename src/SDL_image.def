@@ -1,0 +1,3 @@
+LIBRARY SDL_image
+EXPORTS
+	IMG_Load @3
