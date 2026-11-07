@@ -242,6 +242,14 @@ static void BuildScriptEdits()
 		// Valve: turning speed measured as degrees per tick
 		{ "level01_17_worm_nest.hps", "if(fSpeed > 0.3f)", "if(fSpeed > " + valve + ")", 1 },
 		{ "level01_17_worm_nest.hps", "if(fSpeed < -0.3f)", "if(fSpeed < -" + valve + ")", 1 },
+		// Explosive mix: OnUpdate counts calls with rough handling (speed over 6, or a jump in
+		// speed of over 4 since the last call) and the jar explodes at 10. Both the count and the
+		// jump assume 60 calls a second, so the check is called at 60 Hz. Kept on one line so
+		// script error line numbers don't move.
+		{ "level01_19_door_shaft.hps", "float fPrevSpeed=0;",
+		  "float fPrevSpeed=0; float fCarryMixTicks=0;", 1 },
+		{ "level01_19_door_shaft.hps", "UpdateCarryMix();",
+		  "fCarryMixTicks += " + K + "; if(fCarryMixTicks >= 1.0f) { fCarryMixTicks -= 1.0f; UpdateCarryMix(); }", 1 },
 	};
 }
 

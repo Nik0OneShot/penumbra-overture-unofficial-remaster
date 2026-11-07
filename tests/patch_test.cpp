@@ -317,14 +317,16 @@ int main(int argc, char** argv)
 		CHECK(inDll((DWORD)load), "script load call redirected");
 
 		static const char* files[] = { "level01_17_worm_nest.hps", "level01_11_new_storage_room.hps",
-									   "level01_04_old_storage.hps", "level01_15_icecave.hps", "level01_14_refinery.hps" };
-		char expect[5][96];
+									   "level01_04_old_storage.hps", "level01_15_icecave.hps", "level01_14_refinery.hps",
+									   "level01_19_door_shaft.hps" };
+		char expect[6][128];
 		sprintf_s(expect[0], "if(fSpeed > %.6ff)", 0.3 * 60 / rate);
 		sprintf_s(expect[1], "float fTimeStep = 1.0f/%d.0f;", rate);
 		sprintf_s(expect[2], "GivePlayerDamage(2.3f*%.6ff, \"BloodSplash\");", 60.0 / rate);
 		sprintf_s(expect[3], "lDuringWaterCount %% %d != 0", (int)(3 * rate / 60.0f + 0.5f));
 		sprintf_s(expect[4], "GetLocalVar(\"breakfancount\") == %d)", rate);
-		for(int i = 0; i < 5; ++i)
+		sprintf_s(expect[5], "fCarryMixTicks += %.6ff; if(fCarryMixTicks >= 1.0f) { fCarryMixTicks -= 1.0f; UpdateCarryMix(); }", 60.0 / rate);
+		for(int i = 0; i < 6; ++i)
 		{
 			char path[MAX_PATH]; sprintf_s(path, "%s\\maps\\%s", g_gameDir, files[i]);
 			g_fakeFile = path;
@@ -334,6 +336,17 @@ int main(int argc, char** argv)
 			char* text = load(NULL, NULL, name, &len);
 			std::string s(text ? text : "", text ? len : 0);
 			CHECK(text && s.find(expect[i]) != std::string::npos, "%s rewritten (contains '%s')", files[i], expect[i]);
+			if(i == 5)
+			{
+				// The explosive mix check: declared once, called once (from OnUpdate), at 60 Hz.
+				size_t calls = 0;
+				for(size_t at = s.find("UpdateCarryMix();"); at != std::string::npos; at = s.find("UpdateCarryMix();", at + 1)) ++calls;
+				CHECK(s.find("float fPrevSpeed=0; float fCarryMixTicks=0;") != std::string::npos && calls == 1,
+					  "explosive mix counter declared, check called once per 60 Hz step");
+				float step = (float)atof(expect[5] + strlen("fCarryMixTicks += ")), acc = 0; int checks = 0;
+				for(int t = 0; t < rate; ++t) { acc += step; if(acc >= 1.0f) { acc -= 1.0f; ++checks; } }
+				CHECK(checks >= 59 && checks <= 60, "explosive mix checked %d times per second at %d Hz", checks, rate);
+			}
 		}
 		// Untouched script: same buffer back
 		char path[MAX_PATH]; sprintf_s(path, "%s\\maps\\level01_01_outside.hps", g_gameDir);
