@@ -33,6 +33,9 @@ namespace H {
 	// cGameSwingDoor: Stop controller SetPidIntegralSize(20)
 	const DWORD DoorPidSize      = 0x0043DA27;	// push 14h
 	const DWORD SetPidIntegralSize = 0x004F48C0;
+	// cEntityLoader_Object::LoadController: SetPidIntegralSize(IntegralSize) for every joint
+	// controller in .ent files (valve/wheel slow-down, levers, self-driving doors)
+	const DWORD LoadControllerPidCall = 0x004E0E37;	// push ebx; mov ecx, esi; call
 
 	// Newton.dll import used for auto-freezing bodies (frames counted per physics step)
 	const DWORD IatSetFreezeTreshold = 0x0063D4CC;
@@ -120,6 +123,22 @@ static const TickImmediate g_tickImmediates[] = {
 	{ 0x00412557, { 0xC7, 0x86, 0xB4, 0x01, 0x00, 0x00 }, 6, 4, 10, "enemy: mesh smoothing ticks" },
 	// mov ebp, 20: worm segment position history (how its body trails the head)
 	{ 0x0041DDC5, { 0xBD }, 1, 4, 20, "worm: segment history ticks" },
+	// mov [esi+58h], 20: dragging. Each idle mouse axis counts mlMoveCount down; at 0 the
+	// dragged door/drawer/lever is braked. Set in OnMoveForwards/Sideways and OnAddYaw/Pitch.
+	{ 0x0048E794, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay" },
+	{ 0x0048E7F4, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay" },
+	{ 0x0048E86D, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay" },
+	{ 0x00491485, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay" },
+	// push 10: grab state PIDs (mGrabPid, mRotatePid) SetErrorNum(10), normal and haptic
+	// versions. Their integral gain is 0 in Overture, so this is for consistency.
+	{ 0x00490851, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00490869, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00490878, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x0049088B, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00492DD3, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00492DEB, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00492DFA, { 0x6A }, 1, 1, 10, "grab: PID window" },
+	{ 0x00492E0D, { 0x6A }, 1, 1, 10, "grab: PID window" },
 };
 
 // A float pushed as an immediate.
@@ -391,6 +410,14 @@ __declspec(naked) static void Stub_BreakPieceForce()
 	}
 }
 
+// Joint controllers from .ent files keep a PID integral over their last N physics ticks; keep
+// it N ticks at 60 Hz. 0 means "no integral" and stays 0.
+typedef void (__fastcall *SetPidIntegralSize_t)(void*, void*, int);
+static void __fastcall Call_ControllerPidSize(void* controller, void* edx, int ticks)
+{
+	((SetPidIntegralSize_t)H::SetPidIntegralSize)(controller, edx, ticks > 0 ? ScaleTicks(ticks) : ticks);
+}
+
 // Props freeze after N physics steps below a speed threshold; keep N in 60 Hz steps.
 typedef void (__cdecl *SetFreezeTreshold_t)(void*, float, float, int);
 static SetFreezeTreshold_t g_setFreezeTreshold;
@@ -478,6 +505,9 @@ bool VerifyHighFramerate()
 	static const u8 doorPid[] = { 0x6A, 0x14, 0x8B, 0xCE, 0x89, 0x5E, 0x40 };
 	ok &= Expect(H::DoorPidSize, doorPid, sizeof(doorPid), "door PID size") &&
 		ExpectCall(H::DoorPidSize + 7, H::SetPidIntegralSize, "door SetPidIntegralSize");
+	static const u8 loaderPid[] = { 0x53, 0x8B, 0xCE };	// push ebx; mov ecx, esi (then three stores)
+	ok &= Expect(H::LoadControllerPidCall - 0xC, loaderPid, sizeof(loaderPid), "controller PID size arg") &&
+		ExpectCall(H::LoadControllerPidCall, H::SetPidIntegralSize, "controller SetPidIntegralSize");
 
 	HMODULE newton = GetModuleHandleA("Newton.dll");
 	FARPROC setFreeze = newton ? GetProcAddress(newton, "NewtonBodySetFreezeTreshold") : NULL;
@@ -514,6 +544,7 @@ void ApplyHighFramerate(int rate)
 
 	u8 doorPid = (u8)ScaleTicks(20);
 	Write(H::DoorPidSize + 1, &doorPid, 1);
+	RedirectCall(H::LoadControllerPidCall, &Call_ControllerPidSize);
 
 	g_setFreezeTreshold = *(SetFreezeTreshold_t*)H::IatSetFreezeTreshold;
 	WriteDword(H::IatSetFreezeTreshold, (DWORD)&Hook_SetFreezeTreshold);

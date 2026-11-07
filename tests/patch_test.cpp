@@ -9,6 +9,7 @@
 #include <GL/gl.h>
 #include <stdio.h>
 #include <math.h>
+#include <share.h>
 #include <string>
 
 typedef unsigned char u8;
@@ -47,6 +48,22 @@ static bool __fastcall FakePortalTest(void* container, void*, void*, void*)
 {
 	++g_fakeCalls;
 	return *(float*)((u8*)container + 0x26C + 0x2D0 + 0xC) >= g_fakeNeedLeftD;
+}
+// A null write inside this exe (in the "game folder" here), caught right away
+static void TriggerHandledFault()
+{
+	__try { *(volatile int*)0 = 1; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+static int g_capPid; static void* g_capPidThis;
+static void __fastcall CapPidSize(void* self, void*, int n) { g_capPidThis = self; g_capPid = n; }
+static int CountLogLines(const char* needle)
+{
+	FILE* f = _fsopen("PenumbraUltrawide.log", "r", _SH_DENYNO);	// the DLL still has it open
+	if(!f) return -1;
+	char line[512]; int n = 0;
+	while(fgets(line, sizeof(line), f)) if(strstr(line, needle)) ++n;
+	fclose(f);
+	return n;
 }
 static float g_capVec[3]; static void* g_capThis;
 static void __fastcall CapVec(void* self, void*, const float* v) { g_capThis = self; memcpy(g_capVec, v, 12); }
@@ -451,6 +468,42 @@ int main(int argc, char** argv)
 		}
 		CHECK(espBefore == espAfter && g_capThis == (void*)0x88 && Near(g_capVec[1], 5 * s) && Near(g_capVec[2], 3 * s),
 			  "debris force x%.2f, stack balanced", s);
+	}
+
+	// 8d2. Ported from the Black Plague remaster: drag brake delay, controller and grab PIDs, EFX
+	{
+		DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+		EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm);
+		int rate = (int)dm.dmDisplayFrequency; if(rate < 60) rate = 60; if(rate > 360) rate = 360;
+		auto ticks = [&](int n) { return (int)(n * (rate / 60.0f) + 0.5f); };
+		bool brake = true;
+		for(DWORD a : { 0x48E794u, 0x48E7F4u, 0x48E86Du, 0x491485u }) brake &= *(int*)(a + 3) == ticks(20);
+		CHECK(brake, "drag brake delay 20 -> %d ticks at all four sites", ticks(20));
+		bool grab = true;
+		for(DWORD a : { 0x490851u, 0x490869u, 0x490878u, 0x49088Bu, 0x492DD3u, 0x492DEBu, 0x492DFAu, 0x492E0Du }) grab &= *(u8*)(a + 1) == ticks(10);
+		CHECK(grab, "grab PID windows 10 -> %d", ticks(10));
+
+		PutJmp(0x4F48C0, &CapPidSize);
+		typedef void (__fastcall *Pid_t)(void*, void*, int);
+		Pid_t loaderPid = (Pid_t)CallTarget(0x4E0E37);
+		CHECK(inDll((DWORD)loaderPid), "entity controller PID size redirected");
+		loaderPid((void*)0x99, 0, 6);
+		int scaled = g_capPid;
+		loaderPid((void*)0x99, 0, 0);
+		CHECK(scaled == ticks(6) && g_capPid == 0 && g_capPidThis == (void*)0x99, "controller IntegralSize 6 -> %d, 0 stays 0", scaled);
+
+		CHECK(*(u8*)0x57F921 == 0x90 && *(u8*)0x57F922 == 0x90, "environmental audio: effect slot mutex always created");
+	}
+
+	// 8d3. Crash reporter: logs faults in game-folder modules, not the DLL's own probes
+	{
+		u8 badObj[0x20] = {}; *(u8**)(badObj + 0x10) = (u8*)0x10;	// image lookup will fault inside the DLL
+		u8 player[0x300] = {}; float p[3] = { 100, 100, 100 };
+		CallCrosshair(player, drawer, badObj, p);	// ImageHalfWidth probes and recovers
+		CHECK(CountLogLines("CRASH:") == 0, "the DLL's own guarded memory probes are not reported");
+		TriggerHandledFault();
+		CHECK(CountLogLines("CRASH: exception C0000005 at patch_test.exe+") == 1 && CountLogLines("writing address 00000000") == 1
+			  && CountLogLines("  eax ") == 1, "fault in a game-folder module logged with module+offset, address and registers");
 	}
 
 	// 8e. Wide-view culling: camera near-plane box and fog-culling box

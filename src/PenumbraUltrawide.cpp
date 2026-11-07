@@ -78,6 +78,11 @@ namespace A {
 	const DWORD FrustumPlanes    = 0x2D0;	// cPlanef[6] (a, b, c, d, normal): left, right, bottom, top, near, far
 	const DWORD FrustumSphereRadius = 0x378;
 	const DWORD PortalBV         = 0x90;	// cPortal::mBV; cPortal::mlId at +4
+
+	// OALWrapper cOAL_EffectSlot constructor (environmental audio): creates its mutex only if
+	// the EFX manager's "threaded" flag (+14h) is set, but the manager sets that flag after
+	// creating the slots, so it is uninitialised here.
+	const DWORD EffectSlotMutexCheck = 0x0057F91C;	// mov cl, [eax+14h]; test cl, cl; je +8; call SDL_CreateMutex
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -94,6 +99,66 @@ void Log(const char* fmt, ...)
 	va_end(va);
 	fputc('\n', g_log);
 	fflush(g_log);
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Crash reporter: for a fatal fault in a module from the game folder, log where it happened,
+// the registers, and the return addresses on the stack that point into game modules.
+
+static volatile int g_probing;	// >0 while our own __try code reads memory that may not exist
+static int g_crashReports;
+
+static bool GameFolderModule(DWORD addr, char* name, size_t n, DWORD* base)
+{
+	HMODULE mod;
+	if(!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+						   (LPCSTR)addr, &mod)) return false;
+	char path[MAX_PATH];
+	if(!GetModuleFileNameA(mod, path, MAX_PATH)) return false;
+	if(_strnicmp(path, g_dir, strlen(g_dir)) != 0) return false;
+	const char* file = strrchr(path, '\\');
+	strncpy_s(name, n, file ? file + 1 : path, _TRUNCATE);
+	*base = (DWORD)mod;
+	return true;
+}
+
+static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep)
+{
+	const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+	DWORD code = er->ExceptionCode;
+	bool fatal = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
+				 code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+				 code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+	if(!fatal || g_probing > 0 || g_crashReports >= 3) return EXCEPTION_CONTINUE_SEARCH;
+
+	char mod[64]; DWORD base;
+	DWORD eip = (DWORD)er->ExceptionAddress;
+	if(!GameFolderModule(eip, mod, sizeof(mod), &base)) return EXCEPTION_CONTINUE_SEARCH;
+	++g_crashReports;
+
+	const CONTEXT* c = ep->ContextRecord;
+	Log("CRASH: exception %08X at %s+%X (%08X)", code, mod, eip - base, eip);
+	if(code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+	{
+		ULONG_PTR kind = er->ExceptionInformation[0];
+		Log("  %s address %08X", kind == 8 ? "executing" : kind == 1 ? "writing" : "reading", (DWORD)er->ExceptionInformation[1]);
+	}
+	Log("  eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X", c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi);
+	Log("  ebp %08X esp %08X eip %08X eflags %08X", c->Ebp, c->Esp, c->Eip, c->EFlags);
+
+	const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+	const DWORD* sp = (const DWORD*)c->Esp;
+	int shown = 0;
+	for(int i = 0; i < 512 && shown < 24 && (const void*)(sp + i + 1) <= tib->StackBase && (const void*)sp >= tib->StackLimit; ++i)
+	{
+		char m2[64]; DWORD b2;
+		if(sp[i] > 0x10000 && GameFolderModule(sp[i], m2, sizeof(m2), &b2))
+		{
+			Log("  [esp+%03X] %s+%X", i * 4, m2, sp[i] - b2);
+			++shown;
+		}
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 int CfgInt(const char* key, int def)
@@ -222,17 +287,20 @@ static void __fastcall Call_DrawLongCursor(void* drawer, void* edx, void* obj, c
 
 static float ImageHalfWidth(void* obj)
 {
+	float half = 0;
+	++g_probing;
 	__try
 	{
 		// cGfxObject::mpMat -> image[diffuse] -> size.x (same path the game uses)
 		u8* mat = *(u8**)((u8*)obj + 0x10);
 		u8* img = **(u8***)(mat + 0xB0);
-		return (float)*(int*)(img + 0x6C) * 0.5f;
+		half = (float)*(int*)(img + 0x6C) * 0.5f;
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER)
 	{
-		return 0;
 	}
+	--g_probing;
+	return half;
 }
 
 // Inventory, notebook, keypad and death menu set the crosshair to their own mouse position,
@@ -390,8 +458,12 @@ static bool __fastcall Call_PortalTest(void* container, void* edx, void* bv, voi
 
 static bool SameBytes(DWORD addr, const void* bytes, size_t n)
 {
-	__try { return memcmp((void*)addr, bytes, n) == 0; }
-	__except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+	bool same = false;
+	++g_probing;
+	__try { same = memcmp((void*)addr, bytes, n) == 0; }
+	__except(EXCEPTION_EXECUTE_HANDLER) {}
+	--g_probing;
+	return same;
 }
 
 bool Expect(DWORD addr, const void* bytes, size_t n, const char* what)
@@ -485,6 +557,8 @@ static bool VerifyGame()
 	static const u8 frustumAdd[] = { 0x81, 0xC1, 0x6C, 0x02, 0x00, 0x00 };	// add ecx, 26Ch
 	ok &= Expect(A::IntersectionFrustumTest, frustumAdd, sizeof(frustumAdd), "visibility frustum")
 		&& ExpectCall(A::IntersectionFrustumTest + 6, A::FrustumCollideBV, "visibility frustum test");
+	static const u8 slotMutex[] = { 0x8A, 0x48, 0x14, 0x84, 0xC9, 0x74, 0x08, 0xE8 };
+	ok &= Expect(A::EffectSlotMutexCheck, slotMutex, sizeof(slotMutex), "effect slot mutex check");
 	return ok;
 }
 
@@ -561,6 +635,12 @@ static void ApplyPatches()
 	g_portalMargin = (float)CfgInt("DoorwayMargin", 2);
 	if(g_portalMargin > 0) RedirectCall(A::PortalTestCall, &Call_PortalTest);
 	Log("  wide-view shadow and fog culling fixed; doorway margin %.0f m", g_portalMargin);
+
+	// Environmental audio: always create the effect slot's mutex (the slot updater thread
+	// locks it), instead of trusting a flag that isn't set yet.
+	static const u8 nop2[] = { 0x90, 0x90 };
+	Write(A::EffectSlotMutexCheck + 5, nop2, 2);
+	Log("  environmental audio slot mutex fixed");
 	int rate = ChooseLogicRate();
 	if(rate != 60)
 	{
@@ -659,6 +739,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 		char path[MAX_PATH];
 		_snprintf_s(path, sizeof(path), _TRUNCATE, "%sPenumbraUltrawide.log", g_dir);
 		g_log = _fsopen(path, "w", _SH_DENYNO);	// readable while the game runs
+		AddVectoredExceptionHandler(1, CrashHandler);
 
 		// The game's code is still encrypted here, but its import table is already filled in.
 		HMODULE sdl = GetModuleHandleA("SDL.dll");

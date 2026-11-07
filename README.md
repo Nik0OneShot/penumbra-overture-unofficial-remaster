@@ -26,6 +26,14 @@ screen, about 1.8× too wide at 21:9. With the fix installed:
   60 times a second, and frames are only drawn after an update, so it never looks smoother
   than 60 FPS. The fix runs the logic at your monitor's refresh rate (or the `LogicRate` you
   set), so motion is genuinely smooth at 120/144/165+ Hz. See below for what that involves.
+- **Environmental audio crash (dormant).** The sound library shared with Black Plague can crash
+  in `SDL.dll` from its sound thread when environmental audio (EFX) is on. An effect slot only
+  creates its lock when a flag is set, and that flag isn't set yet when the slots are made.
+  Overture never turns EFX on, so this can't happen in normal play. The 2-byte fix is applied
+  anyway, matching the Black Plague remaster.
+- **Crash reports:** if the game crashes in its own code or DLLs, `PenumbraUltrawide.log`
+  records where (module and offset), the registers and the call stack, which makes it
+  possible to track the cause down.
 
 ## High framerate
 
@@ -43,7 +51,10 @@ faster. The fix compensates each of these so the game plays as it does at 60 Hz:
   from broken objects.
 - **Enemies:** path following; stair stepping; mesh smoothing; how the worm's body trails its
   head; how long footstep sounds stay audible to them.
-- **Physics:** how long props take to fall asleep after coming to rest; swing-door braking.
+- **Physics:** how long props take to fall asleep after coming to rest; swing-door braking;
+  the PID timing of every joint controller in the entity files (valve and wheel slow-down,
+  levers, doors that drive themselves); how long a dragged door, drawer or lever keeps moving
+  before it brakes.
 - **Level scripts:** steam, acid, freezing-water and closing-door damage; the refinery fan; the
   storage-room crane; the worm-nest valve. These are adjusted as the scripts load; the files on
   disk are untouched.
@@ -54,7 +65,9 @@ frame per update, so the framerate equals the logic rate.
 
 Minor differences that remain: the fear "image trail" effect and screen shake are a little
 quicker, scrape and creak sounds start a little more readily, and sliding down slopes that are
-too steep to stand on is slower. If anything feels off, set `LogicRate=60` to compare.
+too steep to stand on is slower. Physics contacts are also a little stiffer at high rates, so a
+lever or wheel that only reached its end because something sank a few millimetres into
+something else could stop just short. If anything feels off, set `LogicRate=60` to compare.
 
 ## Requirements
 
@@ -103,9 +116,10 @@ in memory:
 | Mouse | `cMouseSDL::Update` (vtable) scales horizontal relative motion by the aspect factor. The four `afVal * 800` cursor multipliers are pointed at a compensating value. |
 | Resolutions | The 17-entry `gvResolutions` table is rewritten in place. |
 | Wide-view culling | `cFrustum::SetViewProjMatrix` sizes `mOriginBV` (used to choose Z-fail shadows) to contain the whole near plane for the actual FOV and aspect, instead of `near*2`. The fog-culling cosine in `cRenderer3D::UpdateRenderList` falls back to the exact view-corner value where `cos(fov*aspect/2)` stops being valid. |
+| Bug fixes & crash reports | OALWrapper's `cOAL_EffectSlot` constructor skips `SDL_CreateMutex` unless the EFX manager's threaded flag is set, which happens only after the slots are built. The `je` is NOPed so the mutex is always created. A vectored exception handler logs fatal faults in game-folder modules: module+offset, the faulting address, registers, and game-module return addresses on the stack. It ignores the DLL's own guarded probes and never changes how an exception is handled. |
 | Doorway margin | Rooms are only drawn when a doorway (portal quad) into them is in view. Some room meshes reach past their quad, so at 21:9 you could see into a room whose quad was just off screen, and it showed black. The portal test in `cSectorVisibilityContainer::SearchSector` is retried with the frustum's side and near planes pushed out by `DoorwayMargin` metres (default 2), then restored. Objects are still culled with the exact view. Rescued doorways are logged. |
 | Logic rate | `cLogicTimer::GetStepSize` is replaced. On the first call (during startup) it sets the timer's milliseconds-per-tick to `1000 / LogicRate`. The tick schedule and every step size, including ones the game caches at startup, follow from that one field. |
-| Tick compensations (`HighFramerate.cpp`) | Each 60 Hz assumption becomes a constant scaled by rate/60 or 60/rate. Shared x87 constants are handled by pointing the one instruction at a scaled copy. Tick counts are patched as immediates. One-tick forces and torques go through small stubs that pass a scaled copy of the vector. Newton's freeze-step count is scaled at its import. Level scripts are rewritten in the buffer that `cSqScript::LoadCharBuffer` returns. If any of these sites doesn't match, the game stays at 60 Hz. |
+| Tick compensations (`HighFramerate.cpp`) | Each 60 Hz assumption becomes a constant scaled by rate/60 or 60/rate. Joint controllers loaded from `.ent` files get their `IntegralSize` scaled in `cEntityLoader_Object::LoadController` (0 stays 0). Shared x87 constants are handled by pointing the one instruction at a scaled copy. Tick counts are patched as immediates. One-tick forces and torques go through small stubs that pass a scaled copy of the vector. Newton's freeze-step count is scaled at its import. Level scripts are rewritten in the buffer that `cSqScript::LoadCharBuffer` returns. If any of these sites doesn't match, the game stays at 60 Hz. |
 
 The DLL patches at the game's first `SDL_Init` call, hooked through the import table in
 `DllMain`. That is before any game object is built, so values stored by constructors are
